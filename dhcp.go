@@ -18,25 +18,25 @@ type DHCPPacket struct {
 	GUID []byte
 
 	ServerIP net.IP
-	//HTTPServer string
 }
 
-func ServeProxyDHCP(port int) error {
-	conn, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", port))
+func ServeProxyDHCP(addr string, booter Booter) error {
+	conn, err := net.ListenPacket("udp4", addr)
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
 	l := ipv4.NewPacketConn(conn)
 	if err = l.SetControlMessage(ipv4.FlagInterface, true); err != nil {
 		return err
 	}
 
-	Log("ProxyDHCP", false, "Listening on port %d", port)
+	Log("ProxyDHCP", "Listening on %s", addr)
 	buf := make([]byte, 1024)
 	for {
 		n, msg, addr, err := l.ReadFrom(buf)
 		if err != nil {
-			Log("ProxyDHCP", false, "Error reading from socket: %s", err)
+			Log("ProxyDHCP", "Error reading from socket: %s", err)
 			continue
 		}
 
@@ -45,90 +45,80 @@ func ServeProxyDHCP(port int) error {
 
 		req, err := ParseDHCP(buf[:n])
 		if err != nil {
-			Log("ProxyDHCP", true, "ParseDHCP: %s", err)
+			Debug("ProxyDHCP", "ParseDHCP: %s", err)
+			continue
+		}
+
+		if err = booter.ShouldBoot(req.MAC); err != nil {
+			Debug("ProxyDHCP", "Not offering to boot %s: %s", req.MAC, err)
 			continue
 		}
 
 		req.ServerIP, err = interfaceIP(msg.IfIndex)
 		if err != nil {
-			Log("ProxyDHCP", false, "Couldn't find an IP address to use to reply to %s: %s", req.MAC, err)
+			Log("ProxyDHCP", "Couldn't find an IP address to use to reply to %s: %s", req.MAC, err)
 			continue
 		}
 
-		Log("ProxyDHCP", false, "Offering to boot %s (via %s)", req.MAC, req.ServerIP)
+		Log("ProxyDHCP", "Offering to boot %s (via %s)", req.MAC, req.ServerIP)
 		if _, err := l.WriteTo(OfferDHCP(req), &ipv4.ControlMessage{
 			IfIndex: msg.IfIndex,
 		}, udpAddr); err != nil {
-			Log("ProxyDHCP", false, "Responding to %s: %s", req.MAC, err)
+			Log("ProxyDHCP", "Responding to %s: %s", req.MAC, err)
 			continue
 		}
 	}
 }
 
-var pxeMenuOffer struct {
-	base []byte
+func OfferDHCP(p *DHCPPacket) []byte {
+	var b bytes.Buffer
 
-	tidOff      int
-	macOff      int
-	serverIPOff int
-	guidOff     int
-	bootOff     int
-}
-
-func init() {
-	r := make([]byte, 236)
-	r[0] = 2     // boot reply
-	r[1] = 1     // PHY = ethernet
-	r[2] = 6     // Hardware address length
-	r[10] = 0x80 // Please speak broadcast
-	pxeMenuOffer.tidOff = 4
-	pxeMenuOffer.macOff = 28
+	// Fixed length BOOTP response
+	var bootp [236]byte
+	bootp[0] = 2     // BOOTP reply
+	bootp[1] = 1     // PHY = ethernet
+	bootp[2] = 6     // Hardware address length
+	bootp[10] = 0x80 // Please speak broadcast
+	copy(bootp[4:], p.TID)
+	copy(bootp[28:], p.MAC)
+	b.Write(bootp[:])
 
 	// DHCP magic
-	r = append(r, dhcpMagic...)
-	// DHCPOFFER
-	r = append(r, 53, 1, 2)
-	// Server ID (IP filled in by OfferDHCP)
-	r = append(r, 54, 4, 0, 0, 0, 0)
-	pxeMenuOffer.serverIPOff = len(r) - 4
+	b.Write(dhcpMagic)
+	// Type = DHCPOFFER
+	b.Write([]byte{53, 1, 2})
+	// Server ID
+	b.Write([]byte{54, 4})
+	b.Write(p.ServerIP)
 	// Vendor class
-	r = append(r, 60, 9)
-	r = append(r, "PXEClient"...)
-	// Client UUID (GUID filled in by OfferDHCP)
-	r = append(r, 97, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-	pxeMenuOffer.guidOff = len(r) - 16
+	b.Write([]byte{60, 9})
+	b.WriteString("PXEClient")
+	// Client UUID
+	b.Write([]byte{97, 17, 0})
+	b.Write(p.GUID)
 
-	p := []byte{}
-	// PXE discovery control - disable broadcast and multicast discovery
-	p = append(p, 6, 1, 3)
-	// PXE boot servers (IP filled in by OfferDHCP)
-	p = append(p, 8, 7, 0x80, 0x00, 1, 0, 0, 0, 0)
-	bootOff := len(p) - 4
-	// PXE boot menu
-	p = append(p, 9, 12, 0x80, 0x00, 9)
-	p = append(p, "Pixiecore"...)
-	// PXE menu prompt/soapbox text
-	p = append(p, 10, 10, 0)
-	p = append(p, "Pixiecore"...)
+	// PXE vendor options
+	var pxe bytes.Buffer
+	// Discovery Control - disable broadcast and multicast boot server discovery
+	pxe.Write([]byte{6, 1, 3})
+	// PXE boot server
+	pxe.Write([]byte{8, 7, 0x80, 0x00, 1})
+	pxe.Write(p.ServerIP)
+	// PXE boot menu - one entry, pointing to the above PXE boot server
+	pxe.Write([]byte{9, 12, 0x80, 0x00, 9})
+	pxe.WriteString("Pixiecore")
+	// PXE menu prompt+timeout
+	pxe.Write([]byte{10, 10, 0})
+	pxe.WriteString("Pixiecore")
+	// End vendor options
+	pxe.WriteByte(255)
+	b.Write([]byte{43, byte(pxe.Len())})
+	pxe.WriteTo(&b)
 
-	// PXE vendor options wrapper
-	r = append(r, 43, byte(len(p)+1))
-	r = append(r, p...)
-	pxeMenuOffer.bootOff = len(r) - len(p) + bootOff
-	r = append(r, 255)
+	// End DHCP options
+	b.WriteByte(255)
 
-	// Done!
-	pxeMenuOffer.base = append(r, 255)
-}
-
-func OfferDHCP(p *DHCPPacket) []byte {
-	r := append([]byte(nil), pxeMenuOffer.base...)
-	copy(r[pxeMenuOffer.tidOff:], p.TID)
-	copy(r[pxeMenuOffer.macOff:], p.MAC)
-	copy(r[pxeMenuOffer.serverIPOff:], p.ServerIP)
-	copy(r[pxeMenuOffer.guidOff:], p.GUID)
-	copy(r[pxeMenuOffer.bootOff:], p.ServerIP)
-	return r
+	return b.Bytes()
 }
 
 func ParseDHCP(b []byte) (req *DHCPPacket, err error) {

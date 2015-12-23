@@ -1,64 +1,94 @@
-package main
+/* Package tftp provides a read-only TFTP server implementation.
+
+ListenAndServe starts a TFTP server with a given address and handler.
+
+	log.Fatal(tftp.ListenAndServe("udp4", ":69", fooHandler))
+
+*/
+package tftp
 
 import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
 	"net"
 	"strconv"
 	"time"
 )
 
-const (
-	ipv4overhead = 28
+const numRetries = 5
 
-	optBlockSize    = "blksize"
-	optTimeout      = "timeout"
-	optTransferSize = "tsize"
-
-	numRetries = 5
-)
-
-type RRQPacket struct {
-	Filename string
-
-	FileSize  int
+type rrq struct {
+	Filename  string
 	BlockSize int
 }
 
-func ServeTFTP(port int, pxelinux []byte) error {
-	conn, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", port))
-	if err != nil {
-		return err
-	}
+// Log is called with messages of general interest.
+var Log = func(msg string, args ...interface{}) {
+	log.Printf(msg, args)
+}
 
-	Log("TFTP", false, "Listening on port %d", port)
+// Debug is called with messages relevant to debugging or tracing the
+// behavior of the TFTP server.
+var Debug = func(string, ...interface{}) {}
+
+// A Handler provides the bytes for a file.
+type Handler func(path string, clientAddr net.Addr) (io.ReadCloser, error)
+
+// Serve accepts incoming TFTP read requests on the listener l,
+// creating a new service goroutine for each. The service goroutines
+// use handler to get a byte stream and send it to the client.
+func Serve(l net.PacketConn, handler Handler) {
+	Log("Listening on %s", l.LocalAddr())
 	buf := make([]byte, 512)
 	for {
-		n, addr, err := conn.ReadFrom(buf)
+		n, addr, err := l.ReadFrom(buf)
 		if err != nil {
-			Log("TFTP", false, "Reading from socket: %s", err)
+			Log("Reading from socket: %s", err)
 			continue
 		}
 
-		req, err := ParseRRQ(addr, buf[:n])
+		req, err := parseRRQ(addr, buf[:n])
 		if err != nil {
-			Log("TFTP", true, "ParseRRQ: %s", err)
-			conn.WriteTo(TFTPError(err), addr)
+			Debug("parseRRQ: %s", err)
+			l.WriteTo(mkError(err), addr)
 			continue
 		}
 
-		go transfer(addr, req, pxelinux)
+		go transfer(addr, req, handler)
 	}
 }
 
-func transfer(addr net.Addr, req *RRQPacket, pxelinux []byte) {
+// ListenAndServe listens on the given address/family and then calls
+// Serve with handler to handle incoming requests.
+func ListenAndServe(family, addr string, handler Handler) error {
+	l, err := net.ListenPacket(family, addr)
+	if err != nil {
+		return err
+	}
+	Serve(l, handler)
+	return nil
+}
+
+// transfer handles a full TFTP transaction with a client.
+func transfer(addr net.Addr, req *rrq, handler Handler) {
 	conn, err := net.Dial("udp4", addr.String())
 	if err != nil {
-		Log("TFTP", false, "Couldn't set up TFTP socket for %s: %s", addr, err)
+		Log("Couldn't set up TFTP socket for %s: %s", addr, err)
 		return
 	}
 	defer conn.Close()
+
+	f, err := handler(req.Filename, addr)
+	if err != nil {
+		Debug("Error getting bytes for %q: %s", req.Filename, err)
+		conn.Write(mkError(err))
+		return
+	}
+	defer f.Close()
 
 	bsize := 512
 	if req.BlockSize > 0 {
@@ -67,40 +97,50 @@ func transfer(addr net.Addr, req *RRQPacket, pxelinux []byte) {
 		bsize = req.BlockSize
 		pkt := []byte{0, 6}
 		pkt = append(pkt, fmt.Sprintf("blksize\x00%d\x00", req.BlockSize)...)
-		if err := TFTPData(conn, pkt, 0); err != nil {
+		if err := sendPacket(conn, pkt, 0); err != nil {
 			// Some PXE ROMs seem to request a transfer with the tsize
 			// option to try and size a buffer, and immediately abort
 			// it on OACK. As such, we're going to declare this a
 			// debug-level error, because it seems part of a normal
 			// boot sequence.
-			Log("TFTP", true, "Transfer to %s failed: %s", addr, err)
+			Debug("Transfer to %s failed: %s", addr, err)
 			return
 		}
 	}
 
-	toTX := pxelinux
 	seq := uint16(1)
 	buf := make([]byte, bsize+4)
 	buf[1] = 3
-	for len(toTX) > 0 {
+	for {
 		binary.BigEndian.PutUint16(buf[2:4], seq)
-		l := len(toTX)
-		if l > bsize {
-			l = bsize
+		n, err := io.ReadFull(f, buf[4:])
+		if err != nil && err != io.ErrUnexpectedEOF {
+			Log("Transfer to %s failed: %s", addr, err)
+			conn.Write(mkError(err))
+			return
 		}
-		copy(buf[4:], toTX[:l])
-		if err = TFTPData(conn, buf[:l+4], seq); err != nil {
-			Log("TFTP", false, "Transfer to %s failed: %s", addr, err)
+		if err = sendPacket(conn, buf[:n+4], seq); err != nil {
+			Log("Transfer to %s failed: %s", addr, err)
 			return
 		}
 		seq++
-		toTX = toTX[l:]
+		if n < bsize {
+			// Transfer complete, we're done.
+			Log("Sent %q to %s", req.Filename, addr)
+			return
+		}
 	}
-
-	Log("TFTP", false, "Sent pxelinux to %s", addr)
 }
 
-func TFTPData(conn net.Conn, b []byte, seq uint16) error {
+// Blob returns a handler that serves b for all paths and clients.
+func Blob(b []byte) Handler {
+	return func(string, net.Addr) (io.ReadCloser, error) {
+		return ioutil.NopCloser(bytes.NewBuffer(b)), nil
+	}
+}
+
+// sendPacket sends one TFTP packet to the client and waits for an ack.
+func sendPacket(conn net.Conn, b []byte, seq uint16) error {
 Tx:
 	for try := 0; try < numRetries; try++ {
 		conn.Write(b)
@@ -134,7 +174,8 @@ Tx:
 	return fmt.Errorf("timed out waiting for ACK #%d", seq)
 }
 
-func TFTPError(err error) []byte {
+// mkError constructs a TFTP ERROR packet.
+func mkError(err error) []byte {
 	s := err.Error()
 	b := make([]byte, len(s)+5)
 	b[1] = 5
@@ -142,7 +183,8 @@ func TFTPError(err error) []byte {
 	return b
 }
 
-func ParseRRQ(addr net.Addr, b []byte) (req *RRQPacket, err error) {
+// parseRRQ parses a raw TFTP packet into an rrq struct.
+func parseRRQ(addr net.Addr, b []byte) (req *rrq, err error) {
 	// Smallest a useful TFTP packet can be is 6 bytes: 2b opcode, 1b
 	// filename, 1b null, 1b mode, 1b null.
 	if len(b) < 6 {
@@ -166,7 +208,7 @@ func ParseRRQ(addr net.Addr, b []byte) (req *RRQPacket, err error) {
 		return nil, fmt.Errorf("%s requested unsupported transfer mode %q", addr, mode)
 	}
 
-	req = &RRQPacket{
+	req = &rrq{
 		Filename: fname,
 	}
 
@@ -202,7 +244,8 @@ func ParseRRQ(addr net.Addr, b []byte) (req *RRQPacket, err error) {
 	return req, nil
 }
 
-func nullStr(b []byte) (string, []byte, bool) {
+// nullStr extracts a null-terminated string from the given bytes.
+func nullStr(b []byte) (str string, remaining []byte, ok bool) {
 	off := bytes.IndexByte(b, 0)
 	if off == -1 {
 		return "", nil, false

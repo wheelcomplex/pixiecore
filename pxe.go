@@ -11,91 +11,106 @@ import (
 
 type PXEPacket struct {
 	DHCPPacket
-	ClientIP        net.IP
-	PXEVendorOption []byte // The bytes for DHCP option 43, for the response.
+	ClientIP net.IP
+	// The boot type requested by the client. We need to mirror this
+	// in the PXE reply.
+	BootType []byte
 
 	HTTPServer string
 }
 
-func ServePXE(pxePort, httpPort int) error {
-	conn, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", pxePort))
+func ServePXE(pxeAddr string, httpPort int) error {
+	conn, err := net.ListenPacket("udp4", pxeAddr)
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
 	l := ipv4.NewPacketConn(conn)
 	if err = l.SetControlMessage(ipv4.FlagInterface, true); err != nil {
 		return err
 	}
 
-	Log("PXE", false, "Listening on port %d", pxePort)
+	Log("PXE", "Listening on %s", pxeAddr)
 	buf := make([]byte, 1024)
 	for {
 		n, msg, addr, err := l.ReadFrom(buf)
 		if err != nil {
-			Log("PXE", false, "Error reading from socket: %s", err)
+			Log("PXE", "Error reading from socket: %s", err)
 			continue
 		}
 
 		req, err := ParsePXE(buf[:n])
 		if err != nil {
-			Log("PXE", true, "ParsePXE: %s", err)
+			Debug("PXE", "ParsePXE: %s", err)
 			continue
 		}
 
-		// TODO: figure out the correct IP
 		req.ServerIP, err = interfaceIP(msg.IfIndex)
+		if err != nil {
+			Log("PXE", "Couldn't find an IP address to use to reply to %s: %s", req.MAC, err)
+			continue
+		}
 		req.HTTPServer = fmt.Sprintf("http://%s:%d/", req.ServerIP, httpPort)
 
-		Log("PXE", false, "Chainloading %s to pxelinux (via %s)", req.MAC, req.ServerIP)
+		Log("PXE", "Chainloading %s (%s) to pxelinux (via %s)", req.MAC, req.ClientIP, req.ServerIP)
 
 		if _, err := l.WriteTo(ReplyPXE(req), &ipv4.ControlMessage{
 			IfIndex: msg.IfIndex,
 		}, addr); err != nil {
-			Log("PXE", false, "Responding to %s: %s", req.MAC, err)
+			Log("PXE", "Responding to %s: %s", req.MAC, err)
 			continue
 		}
 	}
 }
 
 func ReplyPXE(p *PXEPacket) []byte {
-	r := make([]byte, 236)
-	r[0] = 2 // boot reply
-	r[1] = 1 // PHY = ethernet
-	r[2] = 6 // MAC address length
-	copy(r[4:], p.TID)
-	r[10] = 0x80 // speak broadcast
-	copy(r[16:], p.ClientIP)
-	copy(r[20:], p.ServerIP)
-	copy(r[28:], p.MAC)
+	var b bytes.Buffer
+
+	// Fixed length BOOTP response
+	var bootp [236]byte
+	bootp[0] = 2     // BOOTP reply
+	bootp[1] = 1     // PHY = ethernet
+	bootp[2] = 6     // Hardware address length
+	bootp[10] = 0x80 // Please speak broadcast
+	copy(bootp[4:], p.TID)
+	copy(bootp[16:], p.ClientIP)
+	copy(bootp[20:], p.ServerIP)
+	copy(bootp[28:], p.MAC)
 	// Boot file name. Our TFTP server unconditionally serves up
 	// pxelinux no matter the name, so we just put something that
 	// looks nice in packet dumps.
-	copy(r[108:], "boot")
+	copy(bootp[108:], "boot")
+	b.Write(bootp[:])
 
 	// DHCP magic
-	r = append(r, dhcpMagic...)
-	// DHCPACK
-	r = append(r, 53, 1, 5)
+	b.Write(dhcpMagic)
+	// Type = DHCPACK
+	b.Write([]byte{53, 1, 5})
 	// Server ID
-	r = append(r, 54, 4)
-	r = append(r, p.ServerIP...)
+	b.Write([]byte{54, 4})
+	b.Write(p.ServerIP)
 	// Vendor class
-	r = append(r, 60, 9)
-	r = append(r, "PXEClient"...)
+	b.Write([]byte{60, 9})
+	b.WriteString("PXEClient")
 	// Client UUID
-	r = append(r, 97, 17, 0)
-	r = append(r, p.GUID...)
+	b.Write([]byte{97, 17, 0})
+	b.Write(p.GUID)
 	// Mirror the menu selection back at the client
-	r = append(r, p.PXEVendorOption...)
+	b.Write([]byte{43, 7, 71, 4})
+	b.Write(p.BootType)
+	b.WriteByte(255)
 	// Pxelinux path prefix, which makes pxelinux use HTTP for
 	// everything.
-	r = append(r, 210, byte(len(p.HTTPServer)))
-	r = append(r, p.HTTPServer...)
+	b.Write([]byte{210, byte(len(p.HTTPServer))})
+	b.WriteString(p.HTTPServer)
+	// If boot fails, make pxelinux reboot after 5 seconds to try
+	// again.
+	b.Write([]byte{211, 4, 0, 0, 0, 5})
 
-	// Done.
-	r = append(r, 255)
+	// End DHCP options
+	b.WriteByte(255)
 
-	return r
+	return b.Bytes()
 }
 
 func ParsePXE(b []byte) (req *PXEPacket, err error) {
@@ -115,7 +130,7 @@ func ParsePXE(b []byte) (req *PXEPacket, err error) {
 	// should not have random unrelated traffic on it, and if there
 	// is, the clients deserve everything they get.
 	if !bytes.Equal(b[236:240], dhcpMagic) {
-		return nil, fmt.Errorf("packet from %s is not a DHCP request", ret.MAC)
+		return nil, fmt.Errorf("packet from %s (%s) is not a DHCP request", ret.MAC, ret.ClientIP)
 	}
 
 	typ, val, opts := dhcpOption(b[240:])
@@ -123,19 +138,16 @@ func ParsePXE(b []byte) (req *PXEPacket, err error) {
 		switch typ {
 		case 43:
 			pxeTyp, pxeVal, val := dhcpOption(val)
-		pxeOptParse:
 			for pxeTyp != 255 {
 				if pxeTyp == 71 {
-					ret.PXEVendorOption = []byte{43, byte(len(pxeVal) + 3), 71, byte(len(pxeVal))}
-					ret.PXEVendorOption = append(ret.PXEVendorOption, pxeVal...)
-					ret.PXEVendorOption = append(ret.PXEVendorOption, 255)
-					break pxeOptParse
+					ret.BootType = pxeVal
+					break
 				}
 				pxeTyp, pxeVal, val = dhcpOption(val)
 			}
 		case 97:
 			if len(val) != 17 || val[0] != 0 {
-				return nil, fmt.Errorf("packet from %s has malformed option 97", ret.MAC)
+				return nil, fmt.Errorf("packet from %s (%s) has malformed option 97", ret.MAC, ret.ClientIP)
 			}
 			ret.GUID = val[1:]
 		}
@@ -143,10 +155,10 @@ func ParsePXE(b []byte) (req *PXEPacket, err error) {
 	}
 
 	if ret.GUID == nil {
-		return nil, fmt.Errorf("%s is not a PXE client", ret.MAC)
+		return nil, fmt.Errorf("%s (%s) is not a PXE client", ret.MAC, ret.ClientIP)
 	}
-	if ret.PXEVendorOption == nil {
-		return nil, fmt.Errorf("%s hasn't selected a menu option", ret.MAC)
+	if ret.BootType == nil {
+		return nil, fmt.Errorf("%s (%s) hasn't selected a menu option", ret.MAC, ret.ClientIP)
 	}
 
 	// Valid PXE request!

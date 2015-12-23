@@ -8,17 +8,20 @@ Into a big Turing tarpit,
 And now you're using it to boot your PC.
 ```
 
-Booting a linux system over the network is quite tedious. You have to
+Booting a Linux system over the network is quite tedious. You have to
 set up a TFTP server, configure your DHCP server to recognize PXE
 clients, and send them the right set of magical options to get them to
 boot, often fighting rubbish PXE ROM implementations.
 
 Pixiecore aims to simplify this process, by packing the whole process
 into a single binary that can cooperate with your network's existing
-DHCP server. Simply give Pixiecore a Linux kernel and initrd, and it
-will netboot any PXE client that shows up on the network.
+DHCP server.
 
-## Usage
+Pixiecore can be used either as a simple "just boot into this OS
+image" tool, or as a building block of a machine management system
+with its API mode.
+
+## Pixiecore in static mode ("I just want to boot 5 machines")
 
 Run the pixiecore binary, passing it a kernel and initrd, and
 optionally some extra kernel commandline arguments.
@@ -76,7 +79,28 @@ pixiecore -kernel coreos_production_pxe.vmlinuz -initrd coreos_production_pxe_im
 Notice that we're passing an extra commandline argument to make CoreOS
 automatically log in once it's booted.
 
-### Running in Docker
+## Pixiecore in API mode
+
+Think of Pixiecore in API mode as a "PXE to HTTP" translator. Whenever
+Pixiecore sees a machine trying to PXE boot, it will ask a remote HTTP
+API (which you implement) what to do. The API server can tell
+Pixiecore to ignore the machine, or tell it to boot into a given
+kernel/initrd/commandline.
+
+Effectively, Pixiecore in API mode lets you pretend that your machines
+speak a simple JSON protocol when trying to netboot. This makes it
+_far_ easier to play with netbooting in your own software.
+
+To start Pixiecore in API mode, pass it the HTTP API endpoint through
+the `-api` flag. The endpoint you provide must implement the Pixiecore
+boot API, as described in the [API spec](README.api.md).
+
+You can find a sample API server implementation in the `example`
+subdirectory. The code is not production-grade, but gives a short
+illustration of how the protocol works by reimplementing a subset of
+Pixiecore's static mode as an API server.
+
+## Running in Docker
 
 Pixiecore is available as a Docker image called
 `danderson/pixiecore`. It's an automatic Docker Hub build that tracks
@@ -86,14 +110,14 @@ Because Pixiecore needs to listen for DHCP traffic, it has to run with
 the host network stack.
 
 ```shell
-sudo docker run -v .:/image --net=host danderson/pixiecore -kernel /image/coreos_production_pxe.vmlinuz -initrd /image/coreos_prodeuction_pxe_image.cpio.gz
+sudo docker run -v .:/image --net=host danderson/pixiecore -kernel /image/coreos_production_pxe.vmlinuz -initrd /image/coreos_production_pxe_image.cpio.gz
 ```
 
 ## How it works
 
 Pixiecore implements four different, but related protocols in one
 binary, which together can take a PXE ROM from nothing to booting
-linux. They are: ProxyDHCP, PXE, TFTP, and HTTP. Let's walk through
+Linux. They are: ProxyDHCP, PXE, TFTP, and HTTP. Let's walk through
 the boot process for a PXE ROM.
 
 ### DHCP/ProxyDHCP
@@ -172,33 +196,33 @@ Given that some netboot images are quite large (CoreOS clocks in at
 almost 200MB), what we really want is to switch to a more efficient
 protocol. That's where PXELINUX comes in.
 
-PXELINUX is a small bootloader that knows how to boot linux kernels,
-and it comes in a variant that can speak HTTP. Pxelinux is 90kB, which
+PXELINUX is a small bootloader that knows how to boot Linux kernels,
+and it comes in a variant that can speak HTTP. PXELINUX is 90kB, which
 even over TFTP is very fast to transfer.
 
-Thus, Pixiecore uses TFTP only to transfer pxelinux, and from there
+Thus, Pixiecore uses TFTP only to transfer PXELINUX, and from there
 steers it to HTTP for the rest of the loading process.
 
 ### HTTP
 
 We've finally crawled our way up to the late nineties - we can speak
 HTTP! Pixiecore's HTTP server is wonderfully familiar and normal. It
-just serves up a support file that pxelinux needs (`ldlinux.c32`), a
-trivial pxelinux configuration telling it to boot a linux kernel, and
+just serves up a support file that PXELINUX needs (`ldlinux.c32`), a
+trivial PXELINUX configuration telling it to boot a Linux kernel, and
 the user-provided kernel and initrd files.
 
-Pxelinux grabs all of that, and finally, linux boots.
+PXELINUX grabs all of that, and finally, Linux boots.
 
 ### Recap
 
 This is what the whole boot process looks like on the wire.
 
-#### Dramatis Personæ
+#### Dramatis Personae
 
 - **PXE ROM**, a brittle firmware burned into the network card.
 - **DHCP server**, a plain old DHCP server providing network configuration.
 - **Pixieboot**, the Hero and server of ProxyDHCP, PXE, TFTP and HTTP.
-- **Pxelinux**, an open source bootloader of the [Syslinux project](http://www.syslinux.org).
+- **PXELINUX**, an open source bootloader of the [Syslinux project](http://www.syslinux.org).
 
 #### Timeline
 
@@ -209,8 +233,20 @@ This is what the whole boot process looks like on the wire.
 - PXE ROM processes the PXE boot menu, decides to boot menu entry 0.
 - PXE ROM sends a `DHCPREQUEST` to Pixiecore's PXE server, asking for a boot file.
 - Pixiecore's PXE server responds with a `DHCPACK` listing a TFTP
-  server, a boot filename, and a pxelinux vendor option to make it use
+  server, a boot filename, and a PXELINUX vendor option to make it use
   HTTP.
-- PXE ROM downloads pxelinux from Pixiecore's TFTP server, and hands off to pxelinux.
-- Pxelinux fetches its configuration from Pixiecore's HTTP server.
-- Pxelinux fetches a kernel and ramdisk from Pixiecore's HTTP server, and boots linux.
+- PXE ROM downloads PXELINUX from Pixiecore's TFTP server, and hands off to PXELINUX.
+- PXELINUX fetches its configuration from Pixiecore's HTTP server.
+- PXELINUX fetches a kernel and ramdisk from Pixiecore's HTTP server, and boots Linux.
+
+## Development
+You can use [Vagrant](https://www.vagrantup.com/) to quickly setup a test environment:
+
+    (HOST)$ vagrant up --provider=libvirt pxeserver
+    (HOST)$ vagrant ssh pxeserver
+    (PXESERVER)$ wget http://alpha.release.core-os.net/amd64-usr/current/coreos_production_pxe.vmlinuz
+    (PXESERVER)$ wget http://alpha.release.core-os.net/amd64-usr/current/coreos_production_pxe_image.cpio.gz
+    (PXESERVER)$ pixiecore -debug -kernel coreos_production_pxe.vmlinuz -initrd coreos_production_pxe_image.cpio.gz --cmdline coreos.autologin
+    ### In another terminal
+    (HOST)$ vagrant up --provider=libvirt pxeclient1
+

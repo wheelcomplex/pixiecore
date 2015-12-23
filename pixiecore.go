@@ -1,11 +1,15 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"strings"
+	"time"
+
+	"github.com/danderson/pixiecore/tftp"
 )
 
 //go:generate go-bindata -o pxelinux_autogen.go -prefix=pxelinux -ignore=README.md pxelinux
@@ -16,10 +20,14 @@ var (
 	// option ROM, so it's pretty pointless unless you'd playing
 	// packet rewriting tricks or doing simulations with packet
 	// generators.
-	portDHCP = flag.Int("port-dhcp", 67, "Port to listen on for DHCP requests")
-	portPXE  = flag.Int("port-pxe", 4011, "Port to listen on for PXE requests")
-	portTFTP = flag.Int("port-tftp", 69, "Port to listen on for TFTP requests")
-	portHTTP = flag.Int("port-http", 70, "Port to listen on for HTTP requests")
+	portDHCP   = flag.Int("port-dhcp", 67, "Port to listen on for DHCP requests")
+	portPXE    = flag.Int("port-pxe", 4011, "Port to listen on for PXE requests")
+	portTFTP   = flag.Int("port-tftp", 69, "Port to listen on for TFTP requests")
+	portHTTP   = flag.Int("port-http", 70, "Port to listen on for HTTP requests")
+	listenAddr = flag.String("listen-addr", "", "Address to listen on (default all)")
+
+	apiServer  = flag.String("api", "", "Path to the boot API server")
+	apiTimeout = flag.Duration("api-timeout", 5*time.Second, "Timeout on boot API server requests")
 
 	kernelFile    = flag.String("kernel", "", "Path to the linux kernel file to boot")
 	initrdFile    = flag.String("initrd", "", "Comma-separated list of initrds to pass to the kernel")
@@ -28,17 +36,45 @@ var (
 	debug = flag.Bool("debug", false, "Log more things that aren't directly related to booting a recognized client")
 )
 
+func pickBooter() (Booter, error) {
+	switch {
+	case *apiServer != "":
+		if *kernelFile != "" {
+			return nil, errors.New("cannot provide -kernel with -api")
+		}
+		if *initrdFile != "" {
+			return nil, errors.New("cannot provide -initrd with -api")
+		}
+		if *kernelCmdline != "" {
+			return nil, errors.New("cannot provide -cmdline with -api")
+		}
+
+		log.Printf("Starting Pixiecore in API mode, with server %s", *apiServer)
+		return RemoteBooter(*apiServer, *apiTimeout)
+
+	case *kernelFile != "":
+		if *apiServer != "" {
+			return nil, errors.New("cannot provide -api with -kernel")
+		}
+		if *initrdFile == "" {
+			return nil, errors.New("must provide -initrd with -kernel")
+		}
+
+		log.Printf("Starting Pixiecore in static mode")
+		return StaticBooter(*kernelFile, strings.Split(*initrdFile, ","), *kernelCmdline), nil
+
+	default:
+		return nil, errors.New("must specify either -api, or -kernel/-initrd")
+	}
+}
+
 func main() {
 	flag.Parse()
 
-	if *kernelFile == "" {
+	booter, err := pickBooter()
+	if err != nil {
 		flag.Usage()
-		fmt.Fprintf(os.Stderr, "\nERROR: Please provide a linux kernel to boot with -kernel.\n")
-		os.Exit(1)
-	}
-	if *initrdFile == "" {
-		flag.Usage()
-		fmt.Fprintf(os.Stderr, "\nERROR: Please provide an initrd to boot with -initrd.\n")
+		fmt.Fprintf(os.Stderr, "\nERROR: %s\n", err)
 		os.Exit(1)
 	}
 
@@ -53,19 +89,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	initrds := strings.Split(*initrdFile, ",")
-
 	go func() {
-		log.Fatalln(ServeProxyDHCP(*portDHCP))
+		addrDHCP := fmt.Sprintf("%s:%d", *listenAddr, *portDHCP)
+		log.Fatalln(ServeProxyDHCP(addrDHCP, booter))
 	}()
 	go func() {
-		log.Fatalln(ServePXE(*portPXE, *portHTTP))
+		addrPXE := fmt.Sprintf("%s:%d", *listenAddr, *portPXE)
+		log.Fatalln(ServePXE(addrPXE, *portHTTP))
 	}()
 	go func() {
-		log.Fatalln(ServeTFTP(*portTFTP, pxelinux))
+		addrTFTP := fmt.Sprintf("%s:%d", *listenAddr, *portTFTP)
+		tftp.Log = func(msg string, args ...interface{}) { Log("TFTP", msg, args...) }
+		tftp.Debug = func(msg string, args ...interface{}) { Debug("TFTP", msg, args...) }
+		log.Fatalln(tftp.ListenAndServe("udp4", addrTFTP, tftp.Blob(pxelinux)))
 	}()
 	go func() {
-		log.Fatalln(ServeHTTP(*portHTTP, ldlinux, *kernelFile, initrds, *kernelCmdline))
+		log.Fatalln(ServeHTTP(*listenAddr, *portHTTP, booter, ldlinux))
 	}()
 	RecordLogs(*debug)
 }
